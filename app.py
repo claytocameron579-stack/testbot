@@ -12,7 +12,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Hugging Face Config
 HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY")
-HF_MODEL = os.environ.get("HF_MODEL", "google/flan-t5-small")
+HF_MODEL = os.environ.get("HF_MODEL", "google/flan-t5-base")
 HF_API = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
 HEADERS = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
 
@@ -91,3 +91,4 @@ def webhook():
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
