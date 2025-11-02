@@ -1,71 +1,77 @@
 from flask import Flask, request
 import requests
 import os
-from openai import OpenAI
 
 app = Flask(__name__)
 
-# --- Environment Variables ---
+# ----------------------------
+# Environment Variables
+# ----------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
-
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# --- Initialize OpenAI client ---
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Hugging Face Config
+HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY")
+HF_MODEL = os.environ.get("HF_MODEL", "google/flan-t5-small")
+HF_API = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+HEADERS = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
 
-# --- Filters and Settings ---
-KEYWORDS = ["آکواریوم", "ماهی", "غذا", "فیلتر", "گلدفیش", "بخاری", "ضدکلر", "سیفون", "مرجان", "نمک"]
-MAX_USER_TEXT = 1500
+# ----------------------------
+# Keyword Filter (Only Aquarium)
+# ----------------------------
+KEYWORDS = ["آکواریوم", "ماهی", "غذا", "فیلتر", "بخاری", "گلدفیش", "ضدکلر", "سیفون", "مرجان", "نمک"]
 
-
-# --- Telegram helper function ---
+# ----------------------------
+# Helper: Send message to Telegram
+# ----------------------------
 def send_telegram(chat_id, text):
     try:
         requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
     except Exception as e:
-        print("Telegram send error:", e)
+        print("Telegram error:", e)
 
+# ----------------------------
+# Hugging Face AI Response
+# ----------------------------
+def get_ai_reply_hf(user_message: str) -> str:
+    """
+    دریافت پاسخ از مدل Hugging Face (رایگان)
+    """
+    payload = {
+        "inputs": user_message,
+        "parameters": {"max_new_tokens": 200, "temperature": 0.7},
+        "options": {"wait_for_model": True}
+    }
 
-# --- OpenAI response function ---
-def get_ai_reply(user_message: str) -> str:
     try:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "تو یک کارشناس حرفه‌ای آکواریوم و ماهی‌های زینتی هستی. "
-                    "به زبان فارسی و کوتاه جواب بده. "
-                    "اگر سوال خارج از حوزه آکواریوم یا ماهی بود، فقط بگو که نمی‌تونی پاسخ بدی."
-                )
-            },
-            {"role": "user", "content": user_message}
-        ]
+        r = requests.post(HF_API, headers=HEADERS, json=payload, timeout=30)
+        r.raise_for_status()
+        data = r.json()
 
-        completion = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            max_tokens=400,
-            temperature=0.7
-        )
+        # استخراج پاسخ از ساختار API
+        if isinstance(data, list) and len(data) > 0:
+            first = data[0]
+            if isinstance(first, dict):
+                txt = first.get("generated_text") or first.get("summary_text") or ""
+                return txt.strip()
+        elif isinstance(data, dict) and "error" in data:
+            return "⚠️ مدل آماده نیست یا خطایی رخ داده: " + data["error"]
 
-        return completion.choices[0].message.content.strip()
-
+        return "❓ پاسخی از مدل دریافت نشد."
     except Exception as e:
-        print("AI error:", e)
-        return "در ارتباط با هوش مصنوعی مشکلی پیش آمده. لطفاً دوباره تلاش کن."
+        print("HF error:", e)
+        return "خطا در ارتباط با هوش مصنوعی رایگان."
 
-
-# --- Routes ---
-@app.route("/")
+# ----------------------------
+# Flask Routes
+# ----------------------------
+@app.route('/')
 def home():
-    return "🤖 Bot is running with AI!"
+    return "🤖 Telegram Bot with Hugging Face AI is running!"
 
-
-@app.route("/webhook", methods=["POST"])
+@app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json(force=True)
+    data = request.get_json() or {}
     msg = data.get("message", {})
     chat_id = msg.get("chat", {}).get("id")
     text = (msg.get("text") or "").strip()
@@ -73,19 +79,15 @@ def webhook():
     if not chat_id or not text:
         return "ok"
 
-    # فقط اگر درباره‌ی آکواریوم بود
+    # فقط اگر درباره آکواریوم و ماهی بود پاسخ بده
     if not any(k in text for k in KEYWORDS):
         send_telegram(chat_id, "من فقط درباره آکواریوم و ماهی پاسخ می‌دم 🙂")
         return "ok"
 
-    # محدود کردن طول متن
-    if len(text) > MAX_USER_TEXT:
-        text = text[:MAX_USER_TEXT] + " ..."
-
-    reply = get_ai_reply(text)
+    # دریافت پاسخ از Hugging Face
+    reply = get_ai_reply_hf(text)
     send_telegram(chat_id, reply)
     return "ok"
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
