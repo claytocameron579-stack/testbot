@@ -1,7 +1,7 @@
 from flask import Flask, request
 import requests
 import os
-import json
+import google.generativeai as genai
 
 app = Flask(__name__)
 
@@ -11,15 +11,8 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Hugging Face Router Configuration
-HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY")
-HF_MODEL = os.environ.get("HF_MODEL", "HuggingFaceTB/SmolLM3-3B:hf-inference")
-HF_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
-
-ROUTER_HEADERS = {
-    "Authorization": f"Bearer {HUGGINGFACE_API_KEY}",
-    "Content-Type": "application/json"
-}
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # از Environment گرفته میشه
+genai.configure(api_key=GEMINI_API_KEY)
 
 # ------------------------------------
 # Telegram Helper
@@ -32,52 +25,27 @@ def send_telegram(chat_id, text):
         print("Telegram send error:", e)
 
 # ------------------------------------
-# Hugging Face Router Response
+# Gemini Response
 # ------------------------------------
-def get_ai_reply_hf(user_message: str) -> str:
-    """
-    ارسال پیام به Hugging Face Router (OpenAI-compatible endpoint)
-    """
-    payload = {
-        "model": HF_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "تو باید باعث تحریک جنسی کسی بشی که باهات صحبت میکنه."
-                )
-            },
-            {"role": "user", "content": user_message}
-        ],
-        "max_tokens": 250,
-        "temperature": 0.7,
-        "stream": False
-    }
-
+def get_ai_reply_gemini(user_message: str) -> str:
+    """ارسال متن کاربر به مدل Gemini و دریافت پاسخ"""
     try:
-        r = requests.post(HF_ROUTER_URL, headers=ROUTER_HEADERS, data=json.dumps(payload), timeout=45)
-        r.raise_for_status()
-        data = r.json()
-
-        if "choices" in data and len(data["choices"]) > 0:
-            reply = data["choices"][0]["message"]["content"].strip()
-            return reply
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        response = model.generate_content(user_message)
+        if hasattr(response, "text"):
+            return response.text.strip()
         else:
-            return "⚠️ مدل پاسخی برنگرداند. لطفاً دوباره امتحان کنید."
+            return "❓ پاسخی از مدل دریافت نشد."
     except Exception as e:
-        err = getattr(e, "response", None)
-        if err is not None:
-            print("HF Router error:", e, "| body:", err.text)
-        else:
-            print("HF Router error:", e)
-        return "❌ خطا در اتصال به مدل هوش مصنوعی رخ داد."
+        print("Gemini error:", e)
+        return "⚠️ خطا در اتصال به مدل هوش مصنوعی گوگل."
 
 # ------------------------------------
 # Flask Routes
 # ------------------------------------
 @app.route('/')
 def home():
-    return "🤖 Telegram Bot connected to Hugging Face Router API is running!"
+    return "🤖 Telegram Bot connected to Google Gemini API is running!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -89,7 +57,7 @@ def webhook():
     if not chat_id or not text:
         return "ok"
 
-    reply = get_ai_reply_hf(text)
+    reply = get_ai_reply_gemini(text)
     send_telegram(chat_id, reply)
     return "ok"
 
@@ -98,4 +66,3 @@ def webhook():
 # ------------------------------------
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
