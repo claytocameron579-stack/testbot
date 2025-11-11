@@ -3,36 +3,36 @@ from flask import Flask, request
 import requests
 import os
 import re
-from urllib.parse import quote_plus, urlparse
-from bs4 import BeautifulSoup
+from urllib.parse import quote_plus
+import html
 import google.generativeai as genai
 
 app = Flask(__name__)
 
-# ----------------------------------------------------
+# ------------------------------
 # Environment
-# ----------------------------------------------------
+# ------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-# مرجع سایت
-SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "https://irancoral.ir")
+SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "https://irancoral.ir").rstrip("/")
 
-# Gemini init
+# WooCommerce (اختیاری: اگر ندهی، فقط مقالات را می‌آوریم)
+WC_CONSUMER_KEY    = os.environ.get("WC_CONSUMER_KEY")
+WC_CONSUMER_SECRET = os.environ.get("WC_CONSUMER_SECRET")
+
 genai.configure(api_key=GEMINI_API_KEY)
 
-# ----------------------------------------------------
-# Utilities
-# ----------------------------------------------------
+# ------------------------------
+# Helpers
+# ------------------------------
 UA_HEADERS = {
-    "User-Agent": (
+    "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    )
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 }
 
 def send_telegram(chat_id, text):
@@ -40,223 +40,160 @@ def send_telegram(chat_id, text):
         requests.post(
             f"{TELEGRAM_API}/sendMessage",
             json={"chat_id": chat_id, "text": text},
-            timeout=8,
+            timeout=8
         )
     except Exception as e:
         print("Telegram send error:", e)
 
-def is_persian_text(text: str) -> bool:
-    # اگر حداقل یک کاراکتر فارسی/عربی وجود داشته باشد، فارسی در نظر بگیر
-    return any('\u0600' <= ch <= '\u06FF' for ch in text)
+def is_persian_text(s: str) -> bool:
+    return any('\u0600' <= ch <= '\u06FF' for ch in s)
 
-def is_english_only(text: str) -> bool:
-    # اگر هیچ کاراکتر فارسی نباشد و عمدتاً ASCII باشد، انگلیسیِ کامل
-    if is_persian_text(text):
+def is_english_only(s: str) -> bool:
+    if is_persian_text(s):
         return False
     try:
-        text.encode("ascii")
+        s.encode("ascii")
         return True
     except UnicodeEncodeError:
         return False
 
-def http_get(url: str, timeout=12):
-    return requests.get(url, headers=UA_HEADERS, timeout=timeout)
-
-def normalize_url(u: str) -> str:
-    # فقط لینک‌های داخل irancoral.ir را قبول کن
-    try:
-        p = urlparse(u)
-        if not p.scheme:
-            u = SITE_BASE_URL.rstrip('/') + '/' + u.lstrip('/')
-        if "irancoral.ir" in urlparse(u).netloc:
-            return u
-    except Exception:
-        pass
-    return ""
-
-# ----------------------------------------------------
-# IranCoral Crawling (سبک و سریع)
-# ----------------------------------------------------
-def extract_product_info(url: str) -> str:
-    """
-    تلاش برای بیرون‌کشیدن داده‌های محصول ووکامرس از irancoral.ir
-    """
-    try:
-        url = normalize_url(url)
-        if not url:
-            return ""
-        r = http_get(url)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        title = (
-            (soup.select_one("h1.product_title") or soup.select_one("h1.entry-title"))
-            or soup.find("h1")
-        )
-        title = title.get_text(strip=True) if title else ""
-
-        # قیمت
-        price_el = soup.select_one(".woocommerce-Price-amount")
-        if not price_el:
-            price_el = soup.select_one(".price")
-        price = price_el.get_text(strip=True) if price_el else ""
-
-        # وضعیت موجودی
-        stock_el = soup.select_one(".stock")
-        stock = stock_el.get_text(strip=True) if stock_el else ""
-
-        # توضیح کوتاه محصول
-        short_desc_el = soup.select_one(".woocommerce-product-details__short-description")
-        if not short_desc_el:
-            # fallback: بخش توضیحات تب اصلی
-            short_desc_el = soup.select_one("#tab-description") or soup.select_one(".entry-content")
-        short_desc = short_desc_el.get_text(" ", strip=True)[:800] if short_desc_el else ""
-
-        # تجمیع
-        chunks = []
-        if title: chunks.append(f"نام محصول: {title}")
-        if price: chunks.append(f"قیمت: {price}")
-        if stock: chunks.append(f"موجودی: {stock}")
-        if short_desc: chunks.append(f"توضیح: {short_desc}")
-        chunks.append(f"لینک: {url}")
-
-        return "\n".join(chunks).strip()
-    except Exception as e:
-        print("extract_product_info error:", e)
+def strip_html(text: str) -> str:
+    # تبدیل HTML به متن ساده
+    if not text:
         return ""
+    t = re.sub(r'<[^>]+>', ' ', text)
+    t = html.unescape(t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
 
-def extract_article_info(url: str) -> str:
+# ------------------------------
+# WordPress REST (مقالات/آموزش)
+# ------------------------------
+def wp_search_posts(query: str, per_page: int = 5):
     """
-    در صورت مقاله/برگه: متن اصلی را خلاصه استخراج کن
-    """
-    try:
-        url = normalize_url(url)
-        if not url:
-            return ""
-        r = http_get(url)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        content = soup.select_one(".entry-content") or soup.find("article") or soup.body
-        text = content.get_text(" ", strip=True) if content else ""
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
-            return ""
-        return f"مقاله/صفحه: {url}\nمتن: {text[:2000]}"
-    except Exception as e:
-        print("extract_article_info error:", e)
-        return ""
-
-def site_search_snippets(query: str, limit_pages: int = 5):
-    """
-    جستجوی ساده در سایت با پارامتر ?s= (وردپرس) و استخراج چند نتیجه اول
-    سپس هر لینک را باز کرده و خلاصه‌ای کوتاه می‌سازد.
+    گرفتن پست‌های آموزشی مرتبط از WordPress REST:
+    /wp-json/wp/v2/posts?search=...
     """
     try:
-        search_url = f"{SITE_BASE_URL.rstrip('/')}/?s={quote_plus(query)}"
-        r = http_get(search_url)
+        url = f"{SITE_BASE_URL}/wp-json/wp/v2/posts"
+        params = {
+            "search": query,
+            "per_page": per_page,
+            "_fields": "id,link,title,excerpt,content"
+        }
+        r = requests.get(url, params=params, headers=UA_HEADERS, timeout=12)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        links = []
-        # نتایج محصول ووکامرس
-        for a in soup.select("a.woocommerce-LoopProduct-link"):
-            href = a.get("href")
-            if href: links.append(href)
-        # نتایج مقاله/پست
-        for h2 in soup.select("h2.entry-title a"):
-            href = h2.get("href")
-            if href: links.append(href)
-
-        # یکتا و محدود
-        seen = set()
-        uniq = []
-        for u in links:
-            u = normalize_url(u)
-            if u and u not in seen:
-                uniq.append(u)
-                seen.add(u)
-            if len(uniq) >= limit_pages:
-                break
-
-        snippets = []
-        for u in uniq:
-            if "/product/" in u:
-                info = extract_product_info(u)
-            else:
-                info = extract_article_info(u)
-            if info:
-                snippets.append(info)
-        return snippets
+        posts = r.json()
+        results = []
+        for p in posts:
+            title = strip_html((p.get("title") or {}).get("rendered", ""))
+            excerpt = strip_html((p.get("excerpt") or {}).get("rendered", ""))
+            content = strip_html((p.get("content") or {}).get("rendered", ""))
+            link = p.get("link", "")
+            # خلاصه‌ی کوتاه از محتوا
+            body = content if content else excerpt
+            snippet = (body[:900] + "…") if len(body) > 900 else body
+            block = f"عنوان: {title}\nلینک: {link}\nمتن: {snippet}"
+            results.append(block)
+        return results
     except Exception as e:
-        print("site_search_snippets error:", e)
+        print("wp_search_posts error:", e)
         return []
 
-def extract_irancoral_context(user_text: str, max_total_chars: int = 3500) -> str:
+# ------------------------------
+# WooCommerce REST (محصولات) – اختیاری
+# ------------------------------
+def wc_search_products(query: str, per_page: int = 5):
     """
-    - اگر کاربر لینک irancoral داد: همان‌ها را استخراج کن
-    - در غیر این صورت: با ?s= جستجو کن و چند نتیجه خلاصه برگردان
+    اگر WC_CONSUMER_KEY/SECRET ست شده باشد، محصولات را از WooCommerce REST می‌گیرد.
+    /wp-json/wc/v3/products?search=...
     """
-    # لینک‌های ایران‌کورال داخل پیام
-    urls = re.findall(r"https?://[^\s]+", user_text)
-    urls = [u for u in urls if "irancoral.ir" in u]
+    if not WC_CONSUMER_KEY or not WC_CONSUMER_SECRET:
+        return []  # بدون کلید، این بخش را رد کن
 
-    ctx_parts = []
-    total = 0
+    try:
+        url = f"{SITE_BASE_URL}/wp-json/wc/v3/products"
+        params = {
+            "search": query,
+            "per_page": per_page,
+            "consumer_key": WC_CONSUMER_KEY,
+            "consumer_secret": WC_CONSUMER_SECRET,
+        }
+        r = requests.get(url, params=params, headers=UA_HEADERS, timeout=12)
+        r.raise_for_status()
+        items = r.json()
+        results = []
+        for p in items:
+            name = p.get("name", "")
+            price = p.get("price", "")
+            link = p.get("permalink", "")
+            stock = p.get("stock_status", "")
+            sd = strip_html(p.get("short_description", "") or "")
+            stock_fa = "موجود ✅" if stock == "instock" else "ناموجود ❌" if stock else ""
+            line = f"محصول: {name}\nقیمت: {price} تومان\nوضعیت: {stock_fa}\nتوضیح: {sd[:400]}\nلینک: {link}"
+            results.append(line)
+        return results
+    except Exception as e:
+        print("wc_search_products error:", e)
+        return []
 
-    if urls:
-        for u in urls:
-            block = extract_product_info(u) if "/product/" in u else extract_article_info(u)
-            if block:
-                ctx_parts.append(block)
-                total += len(block)
-                if total >= max_total_chars:
-                    break
-    else:
-        # جستجوی آزاد در سایت
-        snips = site_search_snippets(user_text, limit_pages=4)
-        for s in snips:
-            ctx_parts.append(s)
-            total += len(s)
-            if total >= max_total_chars:
-                break
+# ------------------------------
+# Context Builder (فقط از ایران‌کورال)
+# ------------------------------
+def build_irancoral_context(user_text: str, max_chars: int = 3500) -> str:
+    """
+    ابتدا تلاش می‌کنیم از WooCommerce (اگر کلید داری) محصولات مرتبط را بیاوریم.
+    سپس از پست‌های وردپرس (مقالات) نتایج مرتبط را می‌آوریم.
+    همه‌ی منابع، فقط از irancoral.ir هستند.
+    """
+    parts = []
 
-    return "\n\n---\n\n".join(ctx_parts)
+    # محصولات (اگر کلید داری)
+    prod = wc_search_products(user_text, per_page=5)
+    if prod:
+        parts.append("== محصولات مرتبط از ایران‌کورال ==\n" + "\n\n".join(prod))
 
-# ----------------------------------------------------
-# Gemini wrapper (فقط بر اساس کانتکست ایران‌کورال)
-# ----------------------------------------------------
-def get_ai_reply_from_irancoral(user_message: str) -> str:
-    # سیاست زبان:
-    # - اگر کاربر کاملاً غیر فارسی نوشت => اجازه انگلیسی
-    # - در غیر این صورت => فارسی اجباری
+    # مقالات/پست‌ها
+    posts = wp_search_posts(user_text, per_page=5)
+    if posts:
+        parts.append("== مقالات/آموزش از ایران‌کورال ==\n" + "\n\n".join(posts))
+
+    ctx = "\n\n---\n\n".join(parts).strip()
+    if len(ctx) > max_chars:
+        ctx = ctx[:max_chars] + "…"
+    return ctx
+
+# ------------------------------
+# Gemini: فقط بر اساس کانتکست ایران‌کورال
+# ------------------------------
+def answer_with_gemini_irancoral(user_message: str) -> str:
     allow_english = is_english_only(user_message)
     lang_instruction = (
-        "Always answer in English." if allow_english
-        else "فقط و فقط به زبان فارسی پاسخ بده."
+        "Always answer in English."
+        if allow_english else
+        "فقط و فقط به زبان فارسی پاسخ بده."
     )
 
-    # کانتکست از ایران‌کورال
-    context = extract_irancoral_context(user_message)
-
-    # اگر هیچ کانتکستی نتونستیم بگیریم، مدل را مجبور کنیم به صراحت بگوید به منبع ایران‌کورال دسترسی ندارد
+    context = build_irancoral_context(user_message)
     if not context:
+        # حتی اگر هیچ نتیجه‌ای نیاید، صادقانه اعلام کن
         context = (
-            "منابع ایران‌کورال یافت نشد. اگر پاسخ نیاز به منبع دارد، "
-            "صراحتاً بگو که نتیجه‌ای از irancoral.ir پیدا نشد و سؤال تکمیلی بپرس."
+            "هیچ منبعی از irancoral.ir برای این پرسش پیدا نشد. "
+            "اگر پاسخ نیاز به منبع دارد، صراحتاً بگو منبع موجود نیست و از کاربر جزئیات بیشتر بپرس."
         )
 
     system_instruction = (
         f"{lang_instruction}\n"
-        "تو یک کارشناس آکواریوم و ماهی‌های زینتی و فروشگاه ایران‌کورال هستی. "
-        "قانون طلایی: فقط و فقط بر اساس اطلاعاتی که از سایت irancoral.ir در «بخش منابع» ارسال می‌شود پاسخ بده. "
-        "اگر منابع برای پاسخ کافی نیست، خیلی کوتاه بگو که منابع کافی از ایران‌کورال پیدا نشد و بپرس چه جزئیاتی می‌خواهد. "
-        "اگر محصول مناسب در منابع بود، همان را با لینک ایران‌کورال پیشنهاد بده. "
-        "از خودت چیزی اضافه نکن، و از منابع غیر ایران‌کورال استفاده نکن."
+        "تو کارشناس آکواریوم و محصولات فروشگاه ایران‌کورال هستی. "
+        "قانون طلایی: پاسخ را فقط بر پایه «منابع ایران‌کورال» که پایین آمده‌اند بساز؛ "
+        "اگر منابع کافی نیستند، کوتاه بگو «منابع کافی از ایران‌کورال پیدا نشد» و سؤال تکمیلی بپرس. "
+        "اگر محصول مناسب در منابع هست، همان را با لینک ایران‌کورال پیشنهاد بده. "
+        "از منبع دیگری استفاده نکن."
     )
 
     prompt = (
         f"{system_instruction}\n\n"
-        f"بخش منابع (از irancoral.ir):\n{context}\n\n"
+        f"منابع از irancoral.ir:\n{context}\n\n"
         f"پرسش کاربر:\n{user_message}"
     )
 
@@ -270,7 +207,6 @@ def get_ai_reply_from_irancoral(user_message: str) -> str:
             ),
         )
         text = (resp.text or "").strip() if hasattr(resp, "text") else ""
-        # پاکسازی خیلی سبک (اگر احیاناً فرمت عجیب آمد)
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL|re.IGNORECASE).strip()
         if not text:
             return "⚠️ پاسخی تولید نشد. لطفاً سؤال را دقیق‌تر بفرمایید."
@@ -279,12 +215,12 @@ def get_ai_reply_from_irancoral(user_message: str) -> str:
         print("Gemini error:", e)
         return "❌ خطا در اتصال به مدل هوش مصنوعی؛ کمی بعد دوباره تلاش کنید."
 
-# ----------------------------------------------------
-# Flask routes
-# ----------------------------------------------------
+# ------------------------------
+# Flask
+# ------------------------------
 @app.route("/")
 def home():
-    return "🤖 IranCoral AI assistant is running."
+    return "🤖 IranCoral AI (Gemini + WP/Woo REST) is running."
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -296,7 +232,7 @@ def webhook():
     if not chat_id or not text:
         return "ok"
 
-    reply = get_ai_reply_from_irancoral(text)
+    reply = answer_with_gemini_irancoral(text)
     send_telegram(chat_id, reply)
     return "ok"
 
