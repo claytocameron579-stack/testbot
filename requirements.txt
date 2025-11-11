@@ -1,4 +1,6 @@
 Flask
 requests
 gunicorn
+beautifulsoup4
+lxml
 google-generativeai
